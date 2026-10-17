@@ -1,0 +1,7 @@
+Harmonarium logo and app icon
+Copyright (C) 2026 Joshua Nichols
+
+These files are licensed under the same terms as Harmonarium itself: the GNU General Public
+License, version 3 or (at your option) any later version. See ../COPYING.
+
+SPDX-License-Identifier: GPL-3.0-or-later

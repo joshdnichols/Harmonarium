@@ -1,4 +1,29 @@
 #!/usr/bin/env python3
+# Harmonarium - chord permutations written as LilyPond scores
+# Copyright (C) 2026 Joshua Nichols
+# Source code: https://github.com/joshdnichols/Harmonarium
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# The Harmonarium logo is licensed under the same terms. The scores
+# Harmonarium writes are not covered by this license: they carry a CC0
+# 1.0 Universal public domain dedication. Third-party material included
+# with Harmonarium keeps its own license, such as the Academico font
+# embedded in the control panel (SIL Open Font License 1.1) and the CC0
+# badge printed on the scores (a Creative Commons trademark).
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Harmonarium: chord permutations with a small control panel, written as LilyPond scores.
 The companion to Melodarium: the same engine, but every permutation is an
@@ -38,11 +63,6 @@ Pause  - hold in place (Start continues instantly)
 Stop   - end this run and save to chord_progress.json (Start, or a later launch, resumes)
 Reset  - forget progress so the settings can be changed
 
-Ideas for later
-  - Label baselines per line instead of per run: today one height is worked out for the
-    whole run (Plan.label_baselines), so one low chord anywhere pushes every numeral down.
-    Per line, each system would hug its own lowest/highest notes and still be aligned
-    within itself; the height would just differ from line to line.
 """
 
 import glob
@@ -1236,7 +1256,7 @@ def validate(raw):
         idx = lambda r: rank([chords.index(t) for t in r], len(chords), length, repeat_mode)
         if idx(range_end) <= idx(range_start):
             return None, "Permutation not possible: the ending must come after the starting permutation."
-    return {"length": length, "chords": chords, "max_kb": max_kb,
+    return {"length": length, "chords": chords, "max_kb": max_kb, "fit_pages": True,
             "key": key, "mode": mode, "size": size, "extras": extras, "custom": custom,
             "labels": labels, "accidentals": accidentals,
             "frame_start": frame_start, "frame_end": frame_end,
@@ -1251,6 +1271,21 @@ def validate(raw):
             "clef": clef, "pitch": pitch, "placement": placement, "noteheads": noteheads,
             "repeat_mode": repeat_mode,
             "pdf_links": pdf_links, "outline_fonts": outline_fonts}, None
+
+
+def fit_json(raw):
+    """How many systems fit on the first page and on the others with these settings
+    (for the panel's warning under the page sliders)."""
+    try:
+        raw = dict(raw, systems_per_page=MAX_SYSTEMS, first_page_systems=MAX_SYSTEMS,
+                   save_to="", range_start=None, range_end=None)
+        settings, err = validate(raw)
+        if err:
+            return {"ok": False}
+        plan = Plan(dict(settings, fit_pages=False))
+        return {"ok": True, "first": plan.systems_that_fit(True), "rest": plan.systems_that_fit(False)}
+    except Exception:
+        return {"ok": False}
 
 
 PDF_LINKS = {"off": "No links", "notes": "Links on chords", "all": "All links"}
@@ -1338,6 +1373,13 @@ LABEL_GAP_ABOVE = 1.3         # staff spaces from the highest note to the chord 
 LABEL_GAP_BELOW = 2.9         # staff spaces from the lowest note to the numerals' baseline
 BARNUMBER_Y = 2.7             # measure numbers' baseline: just above the top staff line, by the barline
 MARK_ABOVE_NAMES = 2.0        # chunk labels' baseline, staff spaces above the chord names
+PAGE_SYSTEM_ROOM_PT = 740     # letter page: room for the systems and their labels (measured)
+TITLE_BLOCK_SS = 7.4          # first page: one line each of title, subtitle and range line, staff spaces
+TITLE_LINE_SS = 4.0           # each further line of the title
+SUBTITLE_LINE_SS = 3.2        # each further line of the subtitle
+PIECE_LINE_SS = 3.0           # the range line on two lines
+NAMES_UNDER_TITLE_SS = 3.1    # chord names above the first system need extra room under the titles
+FIT_SAFETY_SS = 0.25          # added to each system when counting, so a page is never overfull
 SYSTEM_GAP = 1.5              # staff spaces of clear room between one line's labels and the next line's
 LABEL_PT_PER_CHAR = 5.0      # chord labels at staff size 20, per character
 LINE_ROOM_PT = 470           # room for chords on a line (about 516 pt, less clef and key)
@@ -1397,11 +1439,29 @@ class Plan:
                               or self.music_font.lower() in OUTLINE_REQUIRED)
         self.lilypond = settings.get("lilypond", "2.26")
         self.version = "2.26.0" if self.lilypond == "2.26" else "2.24.0"
+        self.mode = settings.get("repeat_mode", "all")
+        # from SPLIT_FROM chords per measure each measure is split over two lines
+        self.split_at = (self.bar_chords + 1) // 2 if self.bar_chords >= SPLIT_FROM else 0
+        self._voicing_cache = {}
+        self._label_cache = {}
+        self._bar_notes = {}         # voicings of the current line's measures
+        self.name_y, self.roman_y = self.label_baselines()
+        # No more systems on a page than fit with this run's label heights: a page asked
+        # to hold more would spill its last systems onto a page of their own. (Runs from
+        # before this check resume exactly as they were laid out.)
+        self.asked_systems = (self.systems_per_page, self.first_page_systems)
+        self.fit_note = ""
+        if settings.get("fit_pages"):
+            self.systems_per_page = min(self.systems_per_page, self.systems_that_fit(False))
+            self.first_page_systems = min(self.first_page_systems, self.systems_that_fit(True))
+            if (self.systems_per_page, self.first_page_systems) != self.asked_systems:
+                self.fit_note = (f"With these chords' labels only {self.first_page_systems} system(s) fit on "
+                                 f"the first page and {self.systems_per_page} on the others, so the scores "
+                                 "use that many.")
         # Page breaks are placed by this program (fast, low-memory page layout),
         # and each \score holds whole pages, about SCORE_TARGET measures.
         # From SPLIT_FROM chords per measure each measure is split evenly over two lines
         # (no barline at the split), so a page holds half as many measures.
-        self.split_at = (self.bar_chords + 1) // 2 if self.bar_chords >= SPLIT_FROM else 0
         per_page = lambda systems: (max(1, systems // 2) if self.split_at
                                     else systems * self.bars_per_system)
         self.measures_per_page = per_page(self.systems_per_page)        # pages after the first
@@ -1444,9 +1504,6 @@ class Plan:
         # 1234-56, and files also close wherever the chords before the tail change, so the
         # tail always identifies the last permutation. Kept in the settings for resuming.
         self.name_tail = settings.get("name_tail") or self.fitting_tail(settings["chords"])
-        self._voicing_cache = {}
-        self._label_cache = {}
-        self.name_y, self.roman_y = self.label_baselines()
 
     def folder_name(self, settings):
         """The run folder's name, from the settings: length, key, chord size, the chords
@@ -1708,6 +1765,16 @@ class Plan:
             "    \\draw-line #'(0.7 . 0.7)\n"
             "    \\raise #0.7 \\draw-line #'(0.7 . -0.7)\n"
             "}\n\n"
+            "% where a line's chord names (above) and Roman numerals (below) sit, in staff spaces\n"
+            "% from the middle line: set at the start of every line, just clear of that line's\n"
+            "% own highest and lowest notes, so labels hug the music and line up across the line\n"
+            "labelsAt = #(define-music-function (names numerals) (number? number?)\n"
+            "  #{\n"
+            "    \\override TextScript.Y-offset =\n"
+            "      #(lambda (grob) (if (eqv? (ly:grob-property grob 'direction) UP) names numerals))\n"
+            + (f"    \\override Score.RehearsalMark.Y-offset = #(+ names {MARK_ABOVE_NAMES})   % chunk labels\n"
+               if self.labels != "roman" else "") +
+            "  #})\n\n"
             + PERM_BAR_NUMBER
             + "\\paper {\n"
             "  paper-width = 8.5\\in\n"
@@ -1765,9 +1832,8 @@ class Plan:
             f"    \\override TextScript.font-size = #{LABEL_FONT_SIZE}\n"
             "    \\override TextScript.self-alignment-X = #CENTER\n"
             "    \\override TextScript.parent-alignment-X = #CENTER   % centred on the notehead, not its left edge\n"
-            "    % one fixed baseline for all names (above) and all numerals (below), the same\n"
-            "    % across every line and page: just clear of the highest and lowest notes any\n"
-            "    % chord of this run can reach (staff spaces from the middle line)\n"
+            "    % names above, numerals below, each on one baseline across the line: every line\n"
+            "    % sets its own heights with \\labelsAt (see above); this is the run's widest setting\n"
             "    \\override TextScript.outside-staff-priority = ##f\n"
             "    \\override TextScript.Y-offset =\n"
             f"      #(lambda (grob) (if (eqv? (ly:grob-property grob 'direction) UP) {self.name_y:.2f} {self.roman_y:.2f}))\n"
@@ -1831,6 +1897,19 @@ class Plan:
             '    \\bar ""\n'
         )
 
+    def wrap(self, parts, pt_per_char):
+        """Title-block text broken into lines that fit across the page, only between parts."""
+        limit = TEXT_LINE_PT * 20 / self.staff_size / pt_per_char      # characters per line
+        lines, cur, used = [], [], 0
+        for markup, chars in parts:
+            if cur and used + 1 + chars > limit:
+                lines.append(cur)
+                cur, used = [], 0
+            cur.append(markup)
+            used += chars + (1 if used else 0)
+        lines.append(cur)
+        return lines
+
     def fit_lines(self, parts, pt_per_char, leading=None):
         """Markup for title-block text: one centred line if it fits across the page,
         otherwise several centred lines, broken only between the given parts.
@@ -1887,6 +1966,7 @@ class Plan:
                  + btext[boff + self.book_room:])
         parts, n = [self.ly_file_header(), btext, self.ly_score_open(first)], 0
         for i in range(first, last + 1):
+            parts.append(self.ly_line_start(i, n + 1))
             if i == first or i % self.chunk_size == 0:
                 parts.append(self.ly_chunk_mark(i))
             n += 1
@@ -1926,30 +2006,92 @@ class Plan:
     def label_baselines(self):
         """Where the chord names and Roman numerals sit, in staff spaces from the middle
         line: one baseline each for the whole run, just past the highest and lowest note
-        any chosen chord can reach (in any voicing the placement may pick)."""
+        any measure of the run can reach (in any voicing the placement may pick)."""
         middle = CLEF_POS[self.clef]
         lo = hi = 0
-        toks = sorted(set(self.notes + self.frame_before + self.frame_after))
-        # every voicing a chord can actually get: root position at the start of a measure,
-        # then (smooth voice leading) whatever follows from any chord to any other
-        seen = {self.chord_notes(t, None) for t in toks}
-        todo = list(seen)
-        while self.placement == "nearest" and todo and len(seen) < 20000:
-            prev = todo.pop()
-            for t in toks:
-                v = self.chord_notes(t, prev)
-                if v not in seen:
-                    seen.add(v)
-                    todo.append(v)
-        for shape in seen:
+        # every voicing a chord can actually get. A measure starts in root position, and
+        # (smooth voice leading) each next chord follows from the one before it, so only
+        # chains as long as a measure are possible: following them further would reach
+        # voicings that drift far above or below anything a measure can hold.
+        slots = ([[t] for t in self.frame_before] + [sorted(set(self.notes))] * self.length
+                 + [[t] for t in self.frame_after])
+        level = {self.chord_notes(t, None) for t in slots[0]}
+        seen = set(level)
+        for slot in slots[1:]:
+            if self.placement != "nearest":
+                level = {self.chord_notes(t, None) for t in slot}
+            else:
+                level = {self.chord_notes(t, prev) for prev in level for t in slot}
+            seen |= level
+        low_edge, high_edge = self.edges(seen)
+        self.low_edge, self.high_edge = low_edge, high_edge
+        return high_edge + LABEL_GAP_ABOVE, low_edge - LABEL_GAP_BELOW
+
+    def edges(self, shapes):
+        """(bottom of the lowest note, top of the highest) of these chord voicings, in staff
+        spaces from the middle line; never inside the staff."""
+        middle = CLEF_POS[self.clef]
+        lo = hi = 0
+        for shape in shapes:
             for pos, _ in shape:
                 lo, hi = min(lo, pos - middle), max(hi, pos - middle)
             if self.double_bass:
                 lo = min(lo, shape[0][0] - 7 - middle)
-        low_edge = min(-2.0, lo / 2 - 0.5)        # bottom of the lowest notehead (or the staff)
-        high_edge = max(2.0, hi / 2 + 1.0)        # top of the highest note, room for a flat
-        self.low_edge, self.high_edge = low_edge, high_edge
-        return high_edge + LABEL_GAP_ABOVE, low_edge - LABEL_GAP_BELOW
+        return min(-2.0, lo / 2 - 0.5), max(2.0, hi / 2 + 1.0)   # room for a flat above
+
+    def measure_notes(self, i):
+        """The voicings of measure i's chords (frame chords included), in order."""
+        notes = self._bar_notes.get(i)
+        if notes is None:
+            notes, prev = [], None
+            for t in self.frame_before + self.tokens_at(i) + self.frame_after:
+                prev = self.chord_notes(t, prev)
+                notes.append(prev)
+        return notes
+
+    def labels_at(self, shapes):
+        """Put this line's chord names and numerals just clear of its own highest and
+        lowest notes: every line is aligned within itself, and hugs its own music."""
+        low, high = self.edges(shapes)
+        return f"\\labelsAt #{high + LABEL_GAP_ABOVE:.2f} #{low - LABEL_GAP_BELOW:.2f}"
+
+    def ly_line_start(self, i, bar_in_book):
+        """At the start of a line of music: where that line's labels sit."""
+        if self.split_at:              # the line is the first half of measure i
+            notes = self.measure_notes(i)
+            self._bar_notes = {i: notes}
+            return "    " + self.labels_at(notes[:self.split_at]) + "\n"
+        if (bar_in_book - 1) % self.bars_per_system:
+            return ""
+        last = min(i + self.bars_per_system - 1, self.last)
+        self._bar_notes = {j: self.measure_notes(j) for j in range(i, last + 1)}
+        return "    " + self.labels_at([n for j in self._bar_notes for n in self._bar_notes[j]]) + "\n"
+
+    def title_lines(self):
+        """How many lines the title, the subtitle and the range line take on a PDF's first page."""
+        title = [('"Chord Permutations"', 18)] + (
+            [(TITLE_SUFFIX[self.mode], 2 + len(TITLE_SUFFIX[self.mode].split('"')[1]))]
+            if self.mode in TITLE_SUFFIX else [])
+        piece = (2 * self.length + 1) * PIECE_PT_PER_CHORD * self.staff_size / 20
+        return (len(self.wrap(title, TITLE_PT_PER_CHAR)),
+                len(self.wrap(self.subtitle_parts(), SUBTITLE_PT_PER_CHAR)),
+                2 if piece > TEXT_LINE_PT else 1)
+
+    def systems_that_fit(self, first_page):
+        """How many systems fit on a page, from the distance between systems (which holds
+        both lines' labels): measured with LilyPond on letter paper at several staff sizes."""
+        ss = self.staff_size / 4.0                      # one staff space, in points
+        room = PAGE_SYSTEM_ROOM_PT / ss                 # in staff spaces
+        if first_page:
+            t, sub, piece = self.title_lines()
+            room -= (TITLE_BLOCK_SS + TITLE_LINE_SS * (t - 1) + SUBTITLE_LINE_SS * (sub - 1)
+                     + PIECE_LINE_SS * (piece - 1)
+                     + (NAMES_UNDER_TITLE_SS if self.labels != "roman" else 0))
+        n = int((room + SYSTEM_GAP) / (self.system_distance() + FIT_SAFETY_SS))
+        if self.split_at:                               # two lines per measure: whole measures only
+            n -= n % 2
+            return max(2, n)
+        return max(1, n)
 
     def system_distance(self):
         """Middle line to middle line of two systems, in staff spaces: this line's lowest
@@ -1975,15 +2117,15 @@ class Plan:
 
     def ly_bar(self, i, bar_in_book):
         toks = self.frame_before + self.tokens_at(i) + self.frame_after
-        words, prev = [], None
-        for k, t in enumerate(toks):
-            notes = self.chord_notes(t, prev)
-            prev = notes
+        voicings = self.measure_notes(i)
+        words = []
+        for k, (t, notes) in enumerate(zip(toks, voicings)):
             out = ((notes[0][0] - 7, notes[0][1] - 12),) + notes if self.double_bass else notes
             words.append("<" + " ".join(ly_pitch(*n) for n in out) + ">"
                          + (NOTE_LENGTH if k == 0 else "") + self.chord_labels(t))
         if self.split_at:
-            words.insert(self.split_at, '\\bar "" \\break')   # split line, no barline
+            words.insert(self.split_at, '\\bar "" \\break '      # split line, no barline
+                         + self.labels_at(voicings[self.split_at:]))
         line = "    " + " ".join(words) + " |"
         if self.page_ends_after(bar_in_book):
             line += " \\pageBreak"        # a full page: new page (and new line)
@@ -2271,7 +2413,7 @@ class Engine:
                 self.plan = plan
                 self.recent = []
             self.paused = self.stop_requested = False
-            self.status, self.message = "running", ""
+            self.status, self.message = "running", (self.plan.fit_note if self.plan else "")
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
 
@@ -2462,9 +2604,11 @@ class Engine:
                     new_block = True
                 else:
                     text = ""
+                bar_in_book = 1 if book_rel is not None else st.get("book_bars", 0) + 1
+                text += plan.ly_line_start(i, bar_in_book)     # this line's label heights
                 if new_block or i % plan.chunk_size == 0:
                     text += plan.ly_chunk_mark(i)
-                text += plan.ly_bar(i, 1 if book_rel is not None else st.get("book_bars", 0) + 1)
+                text += plan.ly_bar(i, bar_in_book)
                 data = text.encode("ascii")
 
                 if not new_file and (st["file_bytes"] + len(data) + FOOTER_RESERVE
@@ -2535,7 +2679,7 @@ class Engine:
             nt = len(st.get("txt_files", []))
             extra = f" and {nt} text file(s)" if plan.write_txt else ""
             self.message = (f"Finished. {len(st['files'])} score file(s){extra} written to "
-                            f"'{plan.out_dir}'.")
+                            f"'{plan.out_dir}'." + (" " + plan.fit_note if plan.fit_note else ""))
 
     def _finish_txt(self, last, reopen=True):
         """Close the current text list, name it first-last.txt, start a new one."""
@@ -2556,6 +2700,881 @@ class Engine:
 
 
 # ---------------- control panel ----------------
+# ---------------- Harmonarium's own license ----------------
+APP_COPYRIGHT = "Copyright (C) 2026 Joshua Nichols"
+APP_SOURCE_URL = "https://github.com/joshdnichols/Harmonarium"
+APP_LICENSE_SPDX = "GPL-3.0-or-later"
+# the full GNU General Public License, version 3 (served at /license/gpl)
+GPL3_TEXT = """                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU General Public License is a free, copyleft license for
+software and other kinds of works.
+
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+the GNU General Public License is intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.  We, the Free Software Foundation, use the
+GNU General Public License for most of our software; it applies also to
+any other work released this way by its authors.  You can apply it to
+your programs, too.
+
+  When we speak of free software, we are referring to freedom, not
+price.  Our General Public Licenses are designed to make sure that you
+have the freedom to distribute copies of free software (and charge for
+them if you wish), that you receive source code or can get it if you
+want it, that you can change the software or use pieces of it in new
+free programs, and that you know you can do these things.
+
+  To protect your rights, we need to prevent others from denying you
+these rights or asking you to surrender the rights.  Therefore, you have
+certain responsibilities if you distribute copies of the software, or if
+you modify it: responsibilities to respect the freedom of others.
+
+  For example, if you distribute copies of such a program, whether
+gratis or for a fee, you must pass on to the recipients the same
+freedoms that you received.  You must make sure that they, too, receive
+or can get the source code.  And you must show them these terms so they
+know their rights.
+
+  Developers that use the GNU GPL protect your rights with two steps:
+(1) assert copyright on the software, and (2) offer you this License
+giving you legal permission to copy, distribute and/or modify it.
+
+  For the developers' and authors' protection, the GPL clearly explains
+that there is no warranty for this free software.  For both users' and
+authors' sake, the GPL requires that modified versions be marked as
+changed, so that their problems will not be attributed erroneously to
+authors of previous versions.
+
+  Some devices are designed to deny users access to install or run
+modified versions of the software inside them, although the manufacturer
+can do so.  This is fundamentally incompatible with the aim of
+protecting users' freedom to change the software.  The systematic
+pattern of such abuse occurs in the area of products for individuals to
+use, which is precisely where it is most unacceptable.  Therefore, we
+have designed this version of the GPL to prohibit the practice for those
+products.  If such problems arise substantially in other domains, we
+stand ready to extend this provision to those domains in future versions
+of the GPL, as needed to protect the freedom of users.
+
+  Finally, every program is threatened constantly by software patents.
+States should not allow patents to restrict development and use of
+software on general-purpose computers, but in those that do, we wish to
+avoid the special danger that patents applied to a free program could
+make it effectively proprietary.  To prevent this, the GPL assures that
+patents cannot be used to render the program non-free.
+
+  The precise terms and conditions for copying, distribution and
+modification follow.
+
+                       TERMS AND CONDITIONS
+
+  0. Definitions.
+
+  "This License" refers to version 3 of the GNU General Public License.
+
+  "Copyright" also means copyright-like laws that apply to other kinds of
+works, such as semiconductor masks.
+
+  "The Program" refers to any copyrightable work licensed under this
+License.  Each licensee is addressed as "you".  "Licensees" and
+"recipients" may be individuals or organizations.
+
+  To "modify" a work means to copy from or adapt all or part of the work
+in a fashion requiring copyright permission, other than the making of an
+exact copy.  The resulting work is called a "modified version" of the
+earlier work or a work "based on" the earlier work.
+
+  A "covered work" means either the unmodified Program or a work based
+on the Program.
+
+  To "propagate" a work means to do anything with it that, without
+permission, would make you directly or secondarily liable for
+infringement under applicable copyright law, except executing it on a
+computer or modifying a private copy.  Propagation includes copying,
+distribution (with or without modification), making available to the
+public, and in some countries other activities as well.
+
+  To "convey" a work means any kind of propagation that enables other
+parties to make or receive copies.  Mere interaction with a user through
+a computer network, with no transfer of a copy, is not conveying.
+
+  An interactive user interface displays "Appropriate Legal Notices"
+to the extent that it includes a convenient and prominently visible
+feature that (1) displays an appropriate copyright notice, and (2)
+tells the user that there is no warranty for the work (except to the
+extent that warranties are provided), that licensees may convey the
+work under this License, and how to view a copy of this License.  If
+the interface presents a list of user commands or options, such as a
+menu, a prominent item in the list meets this criterion.
+
+  1. Source Code.
+
+  The "source code" for a work means the preferred form of the work
+for making modifications to it.  "Object code" means any non-source
+form of a work.
+
+  A "Standard Interface" means an interface that either is an official
+standard defined by a recognized standards body, or, in the case of
+interfaces specified for a particular programming language, one that
+is widely used among developers working in that language.
+
+  The "System Libraries" of an executable work include anything, other
+than the work as a whole, that (a) is included in the normal form of
+packaging a Major Component, but which is not part of that Major
+Component, and (b) serves only to enable use of the work with that
+Major Component, or to implement a Standard Interface for which an
+implementation is available to the public in source code form.  A
+"Major Component", in this context, means a major essential component
+(kernel, window system, and so on) of the specific operating system
+(if any) on which the executable work runs, or a compiler used to
+produce the work, or an object code interpreter used to run it.
+
+  The "Corresponding Source" for a work in object code form means all
+the source code needed to generate, install, and (for an executable
+work) run the object code and to modify the work, including scripts to
+control those activities.  However, it does not include the work's
+System Libraries, or general-purpose tools or generally available free
+programs which are used unmodified in performing those activities but
+which are not part of the work.  For example, Corresponding Source
+includes interface definition files associated with source files for
+the work, and the source code for shared libraries and dynamically
+linked subprograms that the work is specifically designed to require,
+such as by intimate data communication or control flow between those
+subprograms and other parts of the work.
+
+  The Corresponding Source need not include anything that users
+can regenerate automatically from other parts of the Corresponding
+Source.
+
+  The Corresponding Source for a work in source code form is that
+same work.
+
+  2. Basic Permissions.
+
+  All rights granted under this License are granted for the term of
+copyright on the Program, and are irrevocable provided the stated
+conditions are met.  This License explicitly affirms your unlimited
+permission to run the unmodified Program.  The output from running a
+covered work is covered by this License only if the output, given its
+content, constitutes a covered work.  This License acknowledges your
+rights of fair use or other equivalent, as provided by copyright law.
+
+  You may make, run and propagate covered works that you do not
+convey, without conditions so long as your license otherwise remains
+in force.  You may convey covered works to others for the sole purpose
+of having them make modifications exclusively for you, or provide you
+with facilities for running those works, provided that you comply with
+the terms of this License in conveying all material for which you do
+not control copyright.  Those thus making or running the covered works
+for you must do so exclusively on your behalf, under your direction
+and control, on terms that prohibit them from making any copies of
+your copyrighted material outside their relationship with you.
+
+  Conveying under any other circumstances is permitted solely under
+the conditions stated below.  Sublicensing is not allowed; section 10
+makes it unnecessary.
+
+  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
+
+  No covered work shall be deemed part of an effective technological
+measure under any applicable law fulfilling obligations under article
+11 of the WIPO copyright treaty adopted on 20 December 1996, or
+similar laws prohibiting or restricting circumvention of such
+measures.
+
+  When you convey a covered work, you waive any legal power to forbid
+circumvention of technological measures to the extent such circumvention
+is effected by exercising rights under this License with respect to
+the covered work, and you disclaim any intention to limit operation or
+modification of the work as a means of enforcing, against the work's
+users, your or third parties' legal rights to forbid circumvention of
+technological measures.
+
+  4. Conveying Verbatim Copies.
+
+  You may convey verbatim copies of the Program's source code as you
+receive it, in any medium, provided that you conspicuously and
+appropriately publish on each copy an appropriate copyright notice;
+keep intact all notices stating that this License and any
+non-permissive terms added in accord with section 7 apply to the code;
+keep intact all notices of the absence of any warranty; and give all
+recipients a copy of this License along with the Program.
+
+  You may charge any price or no price for each copy that you convey,
+and you may offer support or warranty protection for a fee.
+
+  5. Conveying Modified Source Versions.
+
+  You may convey a work based on the Program, or the modifications to
+produce it from the Program, in the form of source code under the
+terms of section 4, provided that you also meet all of these conditions:
+
+    a) The work must carry prominent notices stating that you modified
+    it, and giving a relevant date.
+
+    b) The work must carry prominent notices stating that it is
+    released under this License and any conditions added under section
+    7.  This requirement modifies the requirement in section 4 to
+    "keep intact all notices".
+
+    c) You must license the entire work, as a whole, under this
+    License to anyone who comes into possession of a copy.  This
+    License will therefore apply, along with any applicable section 7
+    additional terms, to the whole of the work, and all its parts,
+    regardless of how they are packaged.  This License gives no
+    permission to license the work in any other way, but it does not
+    invalidate such permission if you have separately received it.
+
+    d) If the work has interactive user interfaces, each must display
+    Appropriate Legal Notices; however, if the Program has interactive
+    interfaces that do not display Appropriate Legal Notices, your
+    work need not make them do so.
+
+  A compilation of a covered work with other separate and independent
+works, which are not by their nature extensions of the covered work,
+and which are not combined with it such as to form a larger program,
+in or on a volume of a storage or distribution medium, is called an
+"aggregate" if the compilation and its resulting copyright are not
+used to limit the access or legal rights of the compilation's users
+beyond what the individual works permit.  Inclusion of a covered work
+in an aggregate does not cause this License to apply to the other
+parts of the aggregate.
+
+  6. Conveying Non-Source Forms.
+
+  You may convey a covered work in object code form under the terms
+of sections 4 and 5, provided that you also convey the
+machine-readable Corresponding Source under the terms of this License,
+in one of these ways:
+
+    a) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by the
+    Corresponding Source fixed on a durable physical medium
+    customarily used for software interchange.
+
+    b) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by a
+    written offer, valid for at least three years and valid for as
+    long as you offer spare parts or customer support for that product
+    model, to give anyone who possesses the object code either (1) a
+    copy of the Corresponding Source for all the software in the
+    product that is covered by this License, on a durable physical
+    medium customarily used for software interchange, for a price no
+    more than your reasonable cost of physically performing this
+    conveying of source, or (2) access to copy the
+    Corresponding Source from a network server at no charge.
+
+    c) Convey individual copies of the object code with a copy of the
+    written offer to provide the Corresponding Source.  This
+    alternative is allowed only occasionally and noncommercially, and
+    only if you received the object code with such an offer, in accord
+    with subsection 6b.
+
+    d) Convey the object code by offering access from a designated
+    place (gratis or for a charge), and offer equivalent access to the
+    Corresponding Source in the same way through the same place at no
+    further charge.  You need not require recipients to copy the
+    Corresponding Source along with the object code.  If the place to
+    copy the object code is a network server, the Corresponding Source
+    may be on a different server (operated by you or a third party)
+    that supports equivalent copying facilities, provided you maintain
+    clear directions next to the object code saying where to find the
+    Corresponding Source.  Regardless of what server hosts the
+    Corresponding Source, you remain obligated to ensure that it is
+    available for as long as needed to satisfy these requirements.
+
+    e) Convey the object code using peer-to-peer transmission, provided
+    you inform other peers where the object code and Corresponding
+    Source of the work are being offered to the general public at no
+    charge under subsection 6d.
+
+  A separable portion of the object code, whose source code is excluded
+from the Corresponding Source as a System Library, need not be
+included in conveying the object code work.
+
+  A "User Product" is either (1) a "consumer product", which means any
+tangible personal property which is normally used for personal, family,
+or household purposes, or (2) anything designed or sold for incorporation
+into a dwelling.  In determining whether a product is a consumer product,
+doubtful cases shall be resolved in favor of coverage.  For a particular
+product received by a particular user, "normally used" refers to a
+typical or common use of that class of product, regardless of the status
+of the particular user or of the way in which the particular user
+actually uses, or expects or is expected to use, the product.  A product
+is a consumer product regardless of whether the product has substantial
+commercial, industrial or non-consumer uses, unless such uses represent
+the only significant mode of use of the product.
+
+  "Installation Information" for a User Product means any methods,
+procedures, authorization keys, or other information required to install
+and execute modified versions of a covered work in that User Product from
+a modified version of its Corresponding Source.  The information must
+suffice to ensure that the continued functioning of the modified object
+code is in no case prevented or interfered with solely because
+modification has been made.
+
+  If you convey an object code work under this section in, or with, or
+specifically for use in, a User Product, and the conveying occurs as
+part of a transaction in which the right of possession and use of the
+User Product is transferred to the recipient in perpetuity or for a
+fixed term (regardless of how the transaction is characterized), the
+Corresponding Source conveyed under this section must be accompanied
+by the Installation Information.  But this requirement does not apply
+if neither you nor any third party retains the ability to install
+modified object code on the User Product (for example, the work has
+been installed in ROM).
+
+  The requirement to provide Installation Information does not include a
+requirement to continue to provide support service, warranty, or updates
+for a work that has been modified or installed by the recipient, or for
+the User Product in which it has been modified or installed.  Access to a
+network may be denied when the modification itself materially and
+adversely affects the operation of the network or violates the rules and
+protocols for communication across the network.
+
+  Corresponding Source conveyed, and Installation Information provided,
+in accord with this section must be in a format that is publicly
+documented (and with an implementation available to the public in
+source code form), and must require no special password or key for
+unpacking, reading or copying.
+
+  7. Additional Terms.
+
+  "Additional permissions" are terms that supplement the terms of this
+License by making exceptions from one or more of its conditions.
+Additional permissions that are applicable to the entire Program shall
+be treated as though they were included in this License, to the extent
+that they are valid under applicable law.  If additional permissions
+apply only to part of the Program, that part may be used separately
+under those permissions, but the entire Program remains governed by
+this License without regard to the additional permissions.
+
+  When you convey a copy of a covered work, you may at your option
+remove any additional permissions from that copy, or from any part of
+it.  (Additional permissions may be written to require their own
+removal in certain cases when you modify the work.)  You may place
+additional permissions on material, added by you to a covered work,
+for which you have or can give appropriate copyright permission.
+
+  Notwithstanding any other provision of this License, for material you
+add to a covered work, you may (if authorized by the copyright holders of
+that material) supplement the terms of this License with terms:
+
+    a) Disclaiming warranty or limiting liability differently from the
+    terms of sections 15 and 16 of this License; or
+
+    b) Requiring preservation of specified reasonable legal notices or
+    author attributions in that material or in the Appropriate Legal
+    Notices displayed by works containing it; or
+
+    c) Prohibiting misrepresentation of the origin of that material, or
+    requiring that modified versions of such material be marked in
+    reasonable ways as different from the original version; or
+
+    d) Limiting the use for publicity purposes of names of licensors or
+    authors of the material; or
+
+    e) Declining to grant rights under trademark law for use of some
+    trade names, trademarks, or service marks; or
+
+    f) Requiring indemnification of licensors and authors of that
+    material by anyone who conveys the material (or modified versions of
+    it) with contractual assumptions of liability to the recipient, for
+    any liability that these contractual assumptions directly impose on
+    those licensors and authors.
+
+  All other non-permissive additional terms are considered "further
+restrictions" within the meaning of section 10.  If the Program as you
+received it, or any part of it, contains a notice stating that it is
+governed by this License along with a term that is a further
+restriction, you may remove that term.  If a license document contains
+a further restriction but permits relicensing or conveying under this
+License, you may add to a covered work material governed by the terms
+of that license document, provided that the further restriction does
+not survive such relicensing or conveying.
+
+  If you add terms to a covered work in accord with this section, you
+must place, in the relevant source files, a statement of the
+additional terms that apply to those files, or a notice indicating
+where to find the applicable terms.
+
+  Additional terms, permissive or non-permissive, may be stated in the
+form of a separately written license, or stated as exceptions;
+the above requirements apply either way.
+
+  8. Termination.
+
+  You may not propagate or modify a covered work except as expressly
+provided under this License.  Any attempt otherwise to propagate or
+modify it is void, and will automatically terminate your rights under
+this License (including any patent licenses granted under the third
+paragraph of section 11).
+
+  However, if you cease all violation of this License, then your
+license from a particular copyright holder is reinstated (a)
+provisionally, unless and until the copyright holder explicitly and
+finally terminates your license, and (b) permanently, if the copyright
+holder fails to notify you of the violation by some reasonable means
+prior to 60 days after the cessation.
+
+  Moreover, your license from a particular copyright holder is
+reinstated permanently if the copyright holder notifies you of the
+violation by some reasonable means, this is the first time you have
+received notice of violation of this License (for any work) from that
+copyright holder, and you cure the violation prior to 30 days after
+your receipt of the notice.
+
+  Termination of your rights under this section does not terminate the
+licenses of parties who have received copies or rights from you under
+this License.  If your rights have been terminated and not permanently
+reinstated, you do not qualify to receive new licenses for the same
+material under section 10.
+
+  9. Acceptance Not Required for Having Copies.
+
+  You are not required to accept this License in order to receive or
+run a copy of the Program.  Ancillary propagation of a covered work
+occurring solely as a consequence of using peer-to-peer transmission
+to receive a copy likewise does not require acceptance.  However,
+nothing other than this License grants you permission to propagate or
+modify any covered work.  These actions infringe copyright if you do
+not accept this License.  Therefore, by modifying or propagating a
+covered work, you indicate your acceptance of this License to do so.
+
+  10. Automatic Licensing of Downstream Recipients.
+
+  Each time you convey a covered work, the recipient automatically
+receives a license from the original licensors, to run, modify and
+propagate that work, subject to this License.  You are not responsible
+for enforcing compliance by third parties with this License.
+
+  An "entity transaction" is a transaction transferring control of an
+organization, or substantially all assets of one, or subdividing an
+organization, or merging organizations.  If propagation of a covered
+work results from an entity transaction, each party to that
+transaction who receives a copy of the work also receives whatever
+licenses to the work the party's predecessor in interest had or could
+give under the previous paragraph, plus a right to possession of the
+Corresponding Source of the work from the predecessor in interest, if
+the predecessor has it or can get it with reasonable efforts.
+
+  You may not impose any further restrictions on the exercise of the
+rights granted or affirmed under this License.  For example, you may
+not impose a license fee, royalty, or other charge for exercise of
+rights granted under this License, and you may not initiate litigation
+(including a cross-claim or counterclaim in a lawsuit) alleging that
+any patent claim is infringed by making, using, selling, offering for
+sale, or importing the Program or any portion of it.
+
+  11. Patents.
+
+  A "contributor" is a copyright holder who authorizes use under this
+License of the Program or a work on which the Program is based.  The
+work thus licensed is called the contributor's "contributor version".
+
+  A contributor's "essential patent claims" are all patent claims
+owned or controlled by the contributor, whether already acquired or
+hereafter acquired, that would be infringed by some manner, permitted
+by this License, of making, using, or selling its contributor version,
+but do not include claims that would be infringed only as a
+consequence of further modification of the contributor version.  For
+purposes of this definition, "control" includes the right to grant
+patent sublicenses in a manner consistent with the requirements of
+this License.
+
+  Each contributor grants you a non-exclusive, worldwide, royalty-free
+patent license under the contributor's essential patent claims, to
+make, use, sell, offer for sale, import and otherwise run, modify and
+propagate the contents of its contributor version.
+
+  In the following three paragraphs, a "patent license" is any express
+agreement or commitment, however denominated, not to enforce a patent
+(such as an express permission to practice a patent or covenant not to
+sue for patent infringement).  To "grant" such a patent license to a
+party means to make such an agreement or commitment not to enforce a
+patent against the party.
+
+  If you convey a covered work, knowingly relying on a patent license,
+and the Corresponding Source of the work is not available for anyone
+to copy, free of charge and under the terms of this License, through a
+publicly available network server or other readily accessible means,
+then you must either (1) cause the Corresponding Source to be so
+available, or (2) arrange to deprive yourself of the benefit of the
+patent license for this particular work, or (3) arrange, in a manner
+consistent with the requirements of this License, to extend the patent
+license to downstream recipients.  "Knowingly relying" means you have
+actual knowledge that, but for the patent license, your conveying the
+covered work in a country, or your recipient's use of the covered work
+in a country, would infringe one or more identifiable patents in that
+country that you have reason to believe are valid.
+
+  If, pursuant to or in connection with a single transaction or
+arrangement, you convey, or propagate by procuring conveyance of, a
+covered work, and grant a patent license to some of the parties
+receiving the covered work authorizing them to use, propagate, modify
+or convey a specific copy of the covered work, then the patent license
+you grant is automatically extended to all recipients of the covered
+work and works based on it.
+
+  A patent license is "discriminatory" if it does not include within
+the scope of its coverage, prohibits the exercise of, or is
+conditioned on the non-exercise of one or more of the rights that are
+specifically granted under this License.  You may not convey a covered
+work if you are a party to an arrangement with a third party that is
+in the business of distributing software, under which you make payment
+to the third party based on the extent of your activity of conveying
+the work, and under which the third party grants, to any of the
+parties who would receive the covered work from you, a discriminatory
+patent license (a) in connection with copies of the covered work
+conveyed by you (or copies made from those copies), or (b) primarily
+for and in connection with specific products or compilations that
+contain the covered work, unless you entered into that arrangement,
+or that patent license was granted, prior to 28 March 2007.
+
+  Nothing in this License shall be construed as excluding or limiting
+any implied license or other defenses to infringement that may
+otherwise be available to you under applicable patent law.
+
+  12. No Surrender of Others' Freedom.
+
+  If conditions are imposed on you (whether by court order, agreement or
+otherwise) that contradict the conditions of this License, they do not
+excuse you from the conditions of this License.  If you cannot convey a
+covered work so as to satisfy simultaneously your obligations under this
+License and any other pertinent obligations, then as a consequence you may
+not convey it at all.  For example, if you agree to terms that obligate you
+to collect a royalty for further conveying from those to whom you convey
+the Program, the only way you could satisfy both those terms and this
+License would be to refrain entirely from conveying the Program.
+
+  13. Use with the GNU Affero General Public License.
+
+  Notwithstanding any other provision of this License, you have
+permission to link or combine any covered work with a work licensed
+under version 3 of the GNU Affero General Public License into a single
+combined work, and to convey the resulting work.  The terms of this
+License will continue to apply to the part which is the covered work,
+but the special requirements of the GNU Affero General Public License,
+section 13, concerning interaction through a network will apply to the
+combination as such.
+
+  14. Revised Versions of this License.
+
+  The Free Software Foundation may publish revised and/or new versions of
+the GNU General Public License from time to time.  Such new versions will
+be similar in spirit to the present version, but may differ in detail to
+address new problems or concerns.
+
+  Each version is given a distinguishing version number.  If the
+Program specifies that a certain numbered version of the GNU General
+Public License "or any later version" applies to it, you have the
+option of following the terms and conditions either of that numbered
+version or of any later version published by the Free Software
+Foundation.  If the Program does not specify a version number of the
+GNU General Public License, you may choose any version ever published
+by the Free Software Foundation.
+
+  If the Program specifies that a proxy can decide which future
+versions of the GNU General Public License can be used, that proxy's
+public statement of acceptance of a version permanently authorizes you
+to choose that version for the Program.
+
+  Later license versions may give you additional or different
+permissions.  However, no additional obligations are imposed on any
+author or copyright holder as a result of your choosing to follow a
+later version.
+
+  15. Disclaimer of Warranty.
+
+  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
+IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
+ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+
+  16. Limitation of Liability.
+
+  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
+DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
+PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
+EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+  17. Interpretation of Sections 15 and 16.
+
+  If the disclaimer of warranty and limitation of liability provided
+above cannot be given local legal effect according to their terms,
+reviewing courts shall apply local law that most closely approximates
+an absolute waiver of all civil liability in connection with the
+Program, unless a warranty or assumption of liability accompanies a
+copy of the Program in return for a fee.
+
+                     END OF TERMS AND CONDITIONS
+
+            How to Apply These Terms to Your New Programs
+
+  If you develop a new program, and you want it to be of the greatest
+possible use to the public, the best way to achieve this is to make it
+free software which everyone can redistribute and change under these terms.
+
+  To do so, attach the following notices to the program.  It is safest
+to attach them to the start of each source file to most effectively
+state the exclusion of warranty; and each file should have at least
+the "copyright" line and a pointer to where the full notice is found.
+
+    <one line to give the program's name and a brief idea of what it does.>
+    Copyright (C) <year>  <name of author>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Also add information on how to contact you by electronic and paper mail.
+
+  If the program does terminal interaction, make it output a short
+notice like this when it starts in an interactive mode:
+
+    <program>  Copyright (C) <year>  <name of author>
+    This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.
+    This is free software, and you are welcome to redistribute it
+    under certain conditions; type `show c' for details.
+
+The hypothetical commands `show w' and `show c' should show the appropriate
+parts of the General Public License.  Of course, your program's commands
+might be different; for a GUI interface, you would use an "about box".
+
+  You should also get your employer (if you work as a programmer) or school,
+if any, to sign a "copyright disclaimer" for the program, if necessary.
+For more information on this, and how to apply and follow the GNU GPL, see
+<https://www.gnu.org/licenses/>.
+
+  The GNU General Public License does not permit incorporating your program
+into proprietary programs.  If your program is a subroutine library, you
+may consider it more useful to permit linking proprietary applications with
+the library.  If this is what you want to do, use the GNU Lesser General
+Public License instead of this License.  But first, please read
+<https://www.gnu.org/licenses/why-not-lgpl.html>.
+"""
+# the full CC0 1.0 Universal legal code, for the scores (served at /license/cc0)
+CC0_TEXT = """Creative Commons Legal Code
+
+CC0 1.0 Universal
+
+    CREATIVE COMMONS CORPORATION IS NOT A LAW FIRM AND DOES NOT PROVIDE
+    LEGAL SERVICES. DISTRIBUTION OF THIS DOCUMENT DOES NOT CREATE AN
+    ATTORNEY-CLIENT RELATIONSHIP. CREATIVE COMMONS PROVIDES THIS
+    INFORMATION ON AN "AS-IS" BASIS. CREATIVE COMMONS MAKES NO WARRANTIES
+    REGARDING THE USE OF THIS DOCUMENT OR THE INFORMATION OR WORKS
+    PROVIDED HEREUNDER, AND DISCLAIMS LIABILITY FOR DAMAGES RESULTING FROM
+    THE USE OF THIS DOCUMENT OR THE INFORMATION OR WORKS PROVIDED
+    HEREUNDER.
+
+Statement of Purpose
+
+The laws of most jurisdictions throughout the world automatically confer
+exclusive Copyright and Related Rights (defined below) upon the creator
+and subsequent owner(s) (each and all, an "owner") of an original work of
+authorship and/or a database (each, a "Work").
+
+Certain owners wish to permanently relinquish those rights to a Work for
+the purpose of contributing to a commons of creative, cultural and
+scientific works ("Commons") that the public can reliably and without fear
+of later claims of infringement build upon, modify, incorporate in other
+works, reuse and redistribute as freely as possible in any form whatsoever
+and for any purposes, including without limitation commercial purposes.
+These owners may contribute to the Commons to promote the ideal of a free
+culture and the further production of creative, cultural and scientific
+works, or to gain reputation or greater distribution for their Work in
+part through the use and efforts of others.
+
+For these and/or other purposes and motivations, and without any
+expectation of additional consideration or compensation, the person
+associating CC0 with a Work (the "Affirmer"), to the extent that he or she
+is an owner of Copyright and Related Rights in the Work, voluntarily
+elects to apply CC0 to the Work and publicly distribute the Work under its
+terms, with knowledge of his or her Copyright and Related Rights in the
+Work and the meaning and intended legal effect of CC0 on those rights.
+
+1. Copyright and Related Rights. A Work made available under CC0 may be
+protected by copyright and related or neighboring rights ("Copyright and
+Related Rights"). Copyright and Related Rights include, but are not
+limited to, the following:
+
+  i. the right to reproduce, adapt, distribute, perform, display,
+     communicate, and translate a Work;
+ ii. moral rights retained by the original author(s) and/or performer(s);
+iii. publicity and privacy rights pertaining to a person's image or
+     likeness depicted in a Work;
+ iv. rights protecting against unfair competition in regards to a Work,
+     subject to the limitations in paragraph 4(a), below;
+  v. rights protecting the extraction, dissemination, use and reuse of data
+     in a Work;
+ vi. database rights (such as those arising under Directive 96/9/EC of the
+     European Parliament and of the Council of 11 March 1996 on the legal
+     protection of databases, and under any national implementation
+     thereof, including any amended or successor version of such
+     directive); and
+vii. other similar, equivalent or corresponding rights throughout the
+     world based on applicable law or treaty, and any national
+     implementations thereof.
+
+2. Waiver. To the greatest extent permitted by, but not in contravention
+of, applicable law, Affirmer hereby overtly, fully, permanently,
+irrevocably and unconditionally waives, abandons, and surrenders all of
+Affirmer's Copyright and Related Rights and associated claims and causes
+of action, whether now known or unknown (including existing as well as
+future claims and causes of action), in the Work (i) in all territories
+worldwide, (ii) for the maximum duration provided by applicable law or
+treaty (including future time extensions), (iii) in any current or future
+medium and for any number of copies, and (iv) for any purpose whatsoever,
+including without limitation commercial, advertising or promotional
+purposes (the "Waiver"). Affirmer makes the Waiver for the benefit of each
+member of the public at large and to the detriment of Affirmer's heirs and
+successors, fully intending that such Waiver shall not be subject to
+revocation, rescission, cancellation, termination, or any other legal or
+equitable action to disrupt the quiet enjoyment of the Work by the public
+as contemplated by Affirmer's express Statement of Purpose.
+
+3. Public License Fallback. Should any part of the Waiver for any reason
+be judged legally invalid or ineffective under applicable law, then the
+Waiver shall be preserved to the maximum extent permitted taking into
+account Affirmer's express Statement of Purpose. In addition, to the
+extent the Waiver is so judged Affirmer hereby grants to each affected
+person a royalty-free, non transferable, non sublicensable, non exclusive,
+irrevocable and unconditional license to exercise Affirmer's Copyright and
+Related Rights in the Work (i) in all territories worldwide, (ii) for the
+maximum duration provided by applicable law or treaty (including future
+time extensions), (iii) in any current or future medium and for any number
+of copies, and (iv) for any purpose whatsoever, including without
+limitation commercial, advertising or promotional purposes (the
+"License"). The License shall be deemed effective as of the date CC0 was
+applied by Affirmer to the Work. Should any part of the License for any
+reason be judged legally invalid or ineffective under applicable law, such
+partial invalidity or ineffectiveness shall not invalidate the remainder
+of the License, and in such case Affirmer hereby affirms that he or she
+will not (i) exercise any of his or her remaining Copyright and Related
+Rights in the Work or (ii) assert any associated claims and causes of
+action with respect to the Work, in either case contrary to Affirmer's
+express Statement of Purpose.
+
+4. Limitations and Disclaimers.
+
+ a. No trademark or patent rights held by Affirmer are waived, abandoned,
+    surrendered, licensed or otherwise affected by this document.
+ b. Affirmer offers the Work as-is and makes no representations or
+    warranties of any kind concerning the Work, express, implied,
+    statutory or otherwise, including without limitation warranties of
+    title, merchantability, fitness for a particular purpose, non
+    infringement, or the absence of latent or other defects, accuracy, or
+    the present or absence of errors, whether or not discoverable, all to
+    the greatest extent permissible under applicable law.
+ c. Affirmer disclaims responsibility for clearing rights of other persons
+    that may apply to the Work or any use thereof, including without
+    limitation any person's Copyright and Related Rights in the Work.
+    Further, Affirmer disclaims responsibility for obtaining any necessary
+    consents, permissions or other rights required for any use of the
+    Work.
+ d. Affirmer understands and acknowledges that Creative Commons is not a
+    party to this document and has no duty or obligation with respect to
+    this CC0 or use of the Work.
+"""
+
+# Python packages that go into the built app with the window (pywebview and what it needs)
+WINDOW_PACKAGES = ["pywebview"]
+
+
+def _license_name(meta):
+    """A short license name from a package's metadata."""
+    expr = meta.get("License-Expression")
+    if expr:
+        return expr
+    lic = (meta.get("License") or "").strip()
+    if lic and len(lic) < 60 and "\n" not in lic:
+        return lic
+    for c in meta.get_all("Classifier") or []:
+        if c.startswith("License :: ") and "OSI Approved :: " in c:
+            return c.split(" :: ")[-1]
+    return "see the package"
+
+
+def installed_window_packages():
+    """When run as a script: pywebview and the packages it needs, if installed here."""
+    try:
+        from importlib import metadata
+    except ImportError:
+        return []
+    out, todo, seen = [], list(WINDOW_PACKAGES), set()
+    while todo:
+        name = todo.pop(0)
+        key = name.lower().replace("_", "-")
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            dist = metadata.distribution(name)
+        except Exception:
+            continue
+        meta = dist.metadata
+        home = meta.get("Home-page") or ""
+        for u in meta.get_all("Project-URL") or []:
+            if not home and "," in u:
+                home = u.split(",", 1)[1].strip()
+        out.append({"name": meta.get("Name") or name, "version": dist.version,
+                    "license": _license_name(meta), "summary": meta.get("Summary") or "",
+                    "home": home, "files": []})
+        for req in dist.requires or []:
+            try:
+                from packaging.requirements import Requirement
+                r = Requirement(req)
+                if r.marker and not r.marker.evaluate({"extra": ""}):
+                    continue
+                todo.append(r.name)
+            except Exception:
+                if "extra ==" not in req:
+                    todo.append(re.split(r"[\s;<>=!~\[(]", req, 1)[0])
+    return out
+
+
+def bundled_packages():
+    """(packages, other items, bundled?) for the Acknowledgements page: in the built app,
+    the list the build wrote (licenses/python-packages/index.json); as a script, what's
+    installed on this computer."""
+    d = app_licenses_dir()
+    index = os.path.join(d, "python-packages", "index.json") if d else ""
+    if index and os.path.isfile(index):
+        try:
+            with open(index, encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("packages", []), data.get("extras", []), True
+        except (OSError, ValueError):
+            pass
+    return installed_window_packages(), [], False
+
 # ---------------- the Harmonarium logo (from harmonarium-light.svg / -dark.svg) ----------------
 # The mark: three stacked ellipses (chords) on one vertical axis, with dots for the notes.
 # Drawn in currentColor, so it takes the panel's ink colour in light and dark mode.
@@ -4508,6 +5527,8 @@ border-radius:6px;background:var(--card);color:var(--ink);min-width:64px;max-wid
 .tonicname{font:600 14px var(--serif)}
 .crampwarn{margin:0 0 8px}
 .footlinks{white-space:nowrap}
+.legal{color:var(--muted);font-size:12px;text-align:center;margin:28px 0 8px;line-height:1.6}
+.legal a{color:var(--muted)}
 .help{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;margin-left:6px;
 border:1px solid var(--line);border-radius:50%;font:600 11px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 color:var(--muted);text-decoration:none;vertical-align:1px;letter-spacing:0}
@@ -4848,6 +5869,10 @@ body{padding-bottom:72px}
     <button type="button" id="dockstart">Start</button>
   </div>
 </div>
+<p class="legal">Harmonarium · Copyright © 2026 Joshua Nichols · Free software under the
+<a href="/license/gpl" target="_blank">GNU GPL v3 or later</a>, with no warranty · Your scores are
+<a href="/license/cc0" target="_blank">CC0</a> · <a href="/acknowledgements#license" target="_blank">License details</a> ·
+<a href="https://github.com/joshdnichols/Harmonarium" target="_blank">Source code</a></p>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -5011,6 +6036,24 @@ const isName = v => ordered().includes(v);
 const SYSTEMS_FIT = {   // staff size: [root position first page, other pages, voice leading first, other]
   18: [11, 12, 11, 12], 20: [10, 11, 11, 11], 22: [9, 10, 10, 11], 24: [8, 9, 9, 10],
   26: [7, 8, 8, 9], 28: [7, 8, 7, 8], 30: [6, 7, 6, 7]};
+// how many systems really fit, worked out by the program from the run's label heights
+let FIT = null, fitKey = "", fitTimer = 0;
+function requestFit(){
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(async () => {
+    if (!picked.length || !estimate()) return;
+    const body = settingsBody(), k = JSON.stringify(body);
+    if (k === fitKey) return;
+    fitKey = k;
+    try {
+      const r = await (await fetch("/fit", JSONPOST(body))).json();
+      if (k !== fitKey) return;
+      const was = JSON.stringify(FIT);
+      FIT = r && r.ok ? r : null;
+      if (JSON.stringify(FIT) !== was) renderSettings();
+    } catch(e){}
+  }, 250);
+}
 function maxSystemsPerPage(first){
   const size = Math.max(18, Math.min(30, draft.staff_size + draft.staff_size % 2));
   const row = SYSTEMS_FIT[size];
@@ -5439,14 +6482,17 @@ function renderSettings(){
   $("firstsys").value = draft.first_page_systems; $("firstsysv").textContent = draft.first_page_systems;
   const tooMany = (el, wanted, fit, where) => {
     $(el).hidden = wanted <= fit;
-    $(el).textContent = "Warning! At staff size " + draft.staff_size + ", only about " + fit +
-      " system" + (fit > 1 ? "s" : "") + " fit on " + where + ". With more, LilyPond moves the extra " +
-      "lines onto added pages, so PDFs come out longer than the pages-per-PDF setting. (Estimate.)";
+    $(el).textContent = FIT
+      ? "Only " + fit + " system" + (fit > 1 ? "s" : "") + " fit on " + where + " with these chords, " +
+        "voicing, labels and staff size, so the scores will use " + fit + "."
+      : "Warning! At staff size " + draft.staff_size + ", only about " + fit +
+        " system" + (fit > 1 ? "s" : "") + " fit on " + where + ". (Estimate.)";
   };
   $("firstcramp").hidden = draft.first_page_systems <= 6;
   $("syscramp").hidden = draft.systems_per_page <= 8;
-  tooMany("firstsyswarn", draft.first_page_systems, maxSystemsPerPage(true), "a first page with the title");
-  tooMany("syswarn", draft.systems_per_page, maxSystemsPerPage(false), "a letter page");
+  tooMany("firstsyswarn", draft.first_page_systems, FIT ? FIT.first : maxSystemsPerPage(true), "the first page, under the title");
+  tooMany("syswarn", draft.systems_per_page, FIT ? FIT.rest : maxSystemsPerPage(false), "each of the other pages");
+  requestFit();
   if (document.activeElement !== $("ppdf")) $("ppdf").value = draft.pages_per_pdf;
   $("ppdf").disabled = locked;
   if ($("textfont").value !== draft.text_font) $("textfont").value = draft.text_font;
@@ -5760,6 +6806,9 @@ $("start").onclick = () => {
 function startBody(){
   if (!estimate()){ say(picked.length ? noPermReason() : "Tick at least one chord."); return null; }
   if (rangeBad){ say($("rangewarn").textContent); return null; }
+  return settingsBody();
+}
+function settingsBody(){
   return {length: draft.length, chords: ordered(), key: draft.key, mode: draft.mode, size: draft.size,
           extras: draft.extras, custom: draft.custom, labels: draft.labels, accidentals: draft.accidentals,
           frame_start: draft.frame_start === true ? TONIC : draft.frame_start,
@@ -6077,6 +7126,22 @@ def make_preview(raw):
                 "error": None if ok else "LilyPond reported a problem:\n" + "\n".join(log.splitlines()[-15:])}
 
 
+def lilypond_crashed(code):
+    """True if LilyPond crashed rather than stopping with an error of its own: a Windows
+    exception code such as 0xC0000005 (access violation), or a signal on Mac/Linux."""
+    return code is not None and (code < 0 or code >= 0xC0000000)
+
+
+def crash_code_text(code):
+    if code is not None and code >= 0xC0000000:
+        name = {0xC0000005: "access violation", 0xC00000FD: "stack overflow",
+                0xC0000017: "out of memory", 0xC0000409: "stack buffer overrun"}.get(code)
+        return f"Windows error 0x{code:08X}" + (f", {name}" if name else "")
+    if code is not None and code < 0:
+        return f"signal {-code}"
+    return f"exit code {code}"
+
+
 def explain_lilypond_failure(log, code):
     """Plain-English reasons for a failed engraving, from LilyPond's output."""
     reasons, seen = [], set()
@@ -6106,6 +7171,10 @@ def explain_lilypond_failure(log, code):
             continue
         if re.search(r"\b(fatal error|error|programming error):", line):
             add("LilyPond reported: " + line.strip())
+    if not reasons and lilypond_crashed(code):
+        add(f"LilyPond crashed ({crash_code_text(code)}). The app engraved each PDF in this file "
+            "on its own, twice, and it still crashed. Try a lower \"Pages per PDF\" or file size "
+            "and run again; the PDFs that were made are kept.")
     if not reasons:
         if not log.strip():
             add(f"LilyPond stopped without any message (exit code {code}). It may have been closed by "
@@ -6202,6 +7271,12 @@ class Engraver:
                     self.done += 1
                     continue
             out = self.proc.communicate()[0]
+            if lilypond_crashed(self.proc.returncode) and not self.stop_flag:
+                first = self.proc
+                out, code = self._retry_by_book(folder, name, lilypond, out, first.returncode)
+                with self.lock:
+                    self.proc = first
+                first.returncode = code
             if self.proc.returncode == 0 and not self.stop_flag:
                 bad = self.outline_failures(path)
                 if bad:
@@ -6228,6 +7303,74 @@ class Engraver:
         with self.lock:
             self.status = "stopped" if self.stop_flag else "done"
             self.current = ""
+
+    def _retry_by_book(self, folder, name, lilypond, out, code):
+        """LilyPond crashed partway through a score file. Engrave each of its PDFs (each
+        \\book) again in a LilyPond of its own, trying each one twice; a crash like this is
+        often a one-off, and a smaller job also needs much less memory. PDFs the crashed
+        run already finished are kept. Returns (log, exit code: 0 if every PDF is made)."""
+        path = os.path.join(folder, name)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return out, code
+        starts = [m.start() for m in re.finditer(r"(?m)^\\book \{", text)]
+        if not starts:
+            return out, code
+        log = [out, f"\n=== LilyPond crashed ({crash_code_text(code)}). "
+                    "Engraving each PDF in this file on its own. ===\n"]
+        final = 0
+        for k, (a, b) in enumerate(zip(starts, starts[1:] + [len(text)])):
+            book = text[a:b]
+            m = re.search(r'\\bookOutputName "([^"]+)"', book)
+            pdf = os.path.join(folder, (m.group(1) if m else "") + ".pdf")
+            if m and os.path.exists(pdf) and os.path.getmtime(pdf) >= mtime:
+                log.append(f"--- {m.group(1)}.pdf: already made before the crash ---\n")
+                continue
+            part = f"_retry{k + 1}.ly"
+            try:
+                with open(os.path.join(folder, part), "w", encoding="utf-8") as f:
+                    f.write(text[:starts[0]] + book)
+            except OSError as e:
+                log.append(f"--- couldn't write {part}: {e} ---\n")
+                final = code
+                continue
+            proc = None
+            for attempt in (1, 2):
+                if self.stop_flag:
+                    break
+                label = (m.group(1) + ".pdf") if m else f"PDF {k + 1}"
+                log.append(f"--- {label}: attempt {attempt} ---\n")
+                with self.lock:
+                    try:
+                        self.proc = subprocess.Popen([lilypond, part], cwd=folder, stdout=subprocess.PIPE,
+                                                     stderr=subprocess.STDOUT, text=True, errors="replace",
+                                                     creationflags=NO_WINDOW)
+                    except OSError as e:
+                        log.append(f"LilyPond couldn't be started: {e}\n")
+                        self.proc = None
+                        break
+                proc = self.proc
+                log.append(proc.communicate()[0])
+                if proc.returncode == 0 or not lilypond_crashed(proc.returncode):
+                    break
+                log.append(f"(crashed again: {crash_code_text(proc.returncode)})\n")
+            rc = proc.returncode if proc is not None else 1
+            if self.stop_flag:
+                rc = rc or 1
+            if rc != 0:
+                final = rc
+            try:
+                os.remove(os.path.join(folder, part))
+            except OSError:
+                pass
+            if self.stop_flag:
+                break
+        if final == 0:
+            log.append("=== Every PDF in this file was made. ===\n")
+        return "".join(log), final
 
     def snapshot(self):
         with self.lock:
@@ -6318,9 +7461,24 @@ def acknowledgements_html():
            "<p class='small'>Harmonarium is built with, and includes, the free software and fonts below, "
            "used under their licenses. Click a license name to read it in full.</p>"]
 
+    # ---- the app's own license (GPL v3 section 5(d): the "Appropriate Legal Notices") ----
+    out.append("<h2 id='license'>Harmonarium</h2><div class='item'><b>GNU General Public License, version 3 "
+               "or later</b>"
+               f"<div class='small'>{esc(APP_COPYRIGHT)}. Harmonarium is free software: you can redistribute it "
+               "and/or modify it under the terms of the GNU General Public License as published by the Free "
+               "Software Foundation, either version 3 of the License, or (at your option) any later version. "
+               "The Harmonarium logo is licensed under the same terms.</div>"
+               "<div class='small'><b>There is no warranty</b>: Harmonarium is distributed in the hope that it "
+               "will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or "
+               "FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for details.</div>"
+               "<div class='small'>The GPL covers Harmonarium's own code and logo, not the scores you make "
+               "with it (see below). Everything else listed here keeps its own license.</div>"
+               "<div class='small'><a href='/license/gpl' target='_blank'>GNU GPL v3 (full text)</a> · "
+               f"<a href='{APP_SOURCE_URL}' target='_blank'>Source code</a></div></div>")
+
     # ---- the scores ----
     out.append("<h2>Your scores</h2><div class='item'><b>CC0 1.0 Universal</b> — the scores carry a "
-               "<a href='https://creativecommons.org/publicdomain/zero/1.0/' target='_blank'>CC0 public domain dedication</a>."
+               "<a href='https://creativecommons.org/publicdomain/zero/1.0/' target='_blank'>CC0 public domain dedication</a> (<a href='/license/cc0' target='_blank'>full legal text</a>). Harmonarium's GPL doesn't apply to them."
                "<div class='small'>The CC0 badge printed on each page is a trademark of Creative Commons, used under the "
                "<a href='https://creativecommons.org/policies' target='_blank'>Creative Commons trademark policy</a> "
                "with a link to the CC0 deed. It comes from Creative Commons' "
@@ -6391,14 +7549,33 @@ def acknowledgements_html():
     else:
         out.append("<p class='small'>LilyPond wasn't found, so its components can't be listed here.</p>")
 
-    # ---- the app itself ----
+    # ---- the app itself: Python and the packages packed in with it ----
     out.append("<h2>This app</h2><div class='item'><b>Python</b> — Python Software Foundation License"
                "<div class='small'>The packaged app includes the Python runtime and its standard library "
                "(including Tcl/Tk for the folder picker). <a href='https://docs.python.org/3/license.html' target='_blank'>"
                "Python license</a> · <a href='https://www.tcl.tk/software/tcltk/license.html' target='_blank'>Tcl/Tk license</a></div></div>"
-               "<div class='item'><b>PyInstaller</b> — GPL version 2 with a bootloader exception"
-               "<div class='small'>Packages the app. Its exception allows apps it builds to use any license. "
+               "<div class='item'><b>PyInstaller</b> — GPL version 2 or later, with a bootloader exception"
+               "<div class='small'>Packages the app. The small starter program it adds is covered by that "
+               "exception, so it doesn't change Harmonarium's own license. "
                "<a href='https://pyinstaller.org/en/stable/license.html' target='_blank'>PyInstaller license</a></div></div>")
+    pkgs, extras, bundled = bundled_packages()
+    if pkgs:
+        out.append("<p class='small'>" + ("Packed into this app for its window:" if bundled else
+                   "Used for the app window, from this computer's Python (not part of Harmonarium):") + "</p>")
+    for p in pkgs:
+        files = " · ".join(link("app", f, os.path.basename(f)) for f in p.get("files", []))
+        home = (f"<a href='{esc(p['home'])}' target='_blank'>project page</a>" if p.get("home") else "")
+        out.append(f"<div class='item'><b>{esc(p['name'])}</b> {esc(p.get('version', ''))} — {esc(p.get('license', ''))}"
+                   + (f"<div class='small'>{esc(p['summary'])}</div>" if p.get("summary") else "")
+                   + (f"<div class='small'>{' · '.join(x for x in (files, home) if x)}</div>" if files or home else "")
+                   + "</div>")
+    for x in extras:
+        files = " · ".join(link("app", f, os.path.basename(f)) for f in x.get("files", []))
+        url = (f"<a href='{esc(x['url'])}' target='_blank'>license</a>" if x.get("url") else "")
+        out.append(f"<div class='item'><b>{esc(x['name'])}</b> — {esc(x.get('license', ''))}"
+                   + (f"<div class='small'>{esc(x['note'])}</div>" if x.get("note") else "")
+                   + (f"<div class='small'>{' · '.join(v for v in (files, url) if v)}</div>" if files or url else "")
+                   + "</div>")
     out.append("</main></body></html>")
     return "\n".join(out)
 
@@ -6503,6 +7680,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "max-age=86400")
             self.end_headers()
             self.wfile.write(data)
+        elif url.path == "/license/gpl":
+            self._send(GPL3_TEXT, "text/plain; charset=utf-8")
+        elif url.path == "/license/cc0":
+            self._send(CC0_TEXT, "text/plain; charset=utf-8")
         elif url.path == "/license/academico":
             self._send(ACADEMICO_LICENSE, "text/plain; charset=utf-8")
         elif url.path == "/guide":
@@ -6578,6 +7759,9 @@ class Handler(BaseHTTPRequestHandler):
             cfg["lilypond_path"] = str(body.get("path", "")).strip().strip('"')
             save_config(cfg)
             self._send(json.dumps(find_lilypond(refresh=True)), "application/json")
+            return
+        elif self.path == "/fit":             # systems that fit on a page, for the panel
+            self._send(json.dumps(fit_json(body)), "application/json")
             return
         elif self.path == "/pool":            # the chords to choose from, for the panel
             self._send(json.dumps(pool_json(body)), "application/json")
@@ -6662,6 +7846,7 @@ It's the companion to Melodarium and works the same way: the same Start, Pause, 
 - [How big a run will be](#how-big-a-run-will-be)
 - [Presets](#presets)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ## Quick start
 
@@ -6801,7 +7986,7 @@ Progressions are listed like counting, using the order of **Chords to use**: wit
 - **Chord names**: above the staff.
 - **Both** (the default): names above, numerals below.
 
-All the numerals in a run sit on one baseline, and so do all the names, the same on every line and page. The heights are worked out once for the whole run, from the highest and lowest notes any of its chords can reach.
+On each line of music, all the numerals sit on one baseline and so do all the names, just clear of that line's own highest and lowest notes. So the labels stay close to the staff, and a line that climbs high or dips low moves only its own labels.
 
 ### Accidentals
 
@@ -6846,7 +8031,7 @@ A small label such as "I ii × ×" marks the first measure of each group of prog
 - **Systems on the first page**: lines of music on the first page of each PDF, under the title. Default 6.
 - **Systems on the other pages**: default 8.
 
-A note appears above a slider when you go past 6 or 8, since pages start to look cramped. A red warning appears below it if LilyPond probably can't fit that many: it would then spill lines onto extra pages.
+A note appears above a slider when you go past 6 or 8, since pages start to look cramped. The app also works out how many systems really fit, from the highest and lowest notes your chords can reach (open voicing and smooth voice leading need more room) and the staff size. If you ask for more, a note below the slider says how many fit, and the scores use that many, so a page never spills its last lines onto a page of their own. The run's messages say so too.
 
 ### Pages per PDF and file size
 
@@ -6904,7 +8089,7 @@ Engraves the first page with the current settings, without starting a run. In th
 
 ### Engrave PDFs
 
-Turns the finished score files into PDFs with LilyPond, one file at a time so memory never fills up. Files whose PDFs are already up to date are skipped, so you can press it again after stopping. **Stop engraving** stops LilyPond and leaves the remaining files for later. If a file fails, the reasons are listed in plain English, and LilyPond's full log is saved next to the file.
+Turns the finished score files into PDFs with LilyPond, one file at a time so memory never fills up. Files whose PDFs are already up to date are skipped, so you can press it again after stopping. **Stop engraving** stops LilyPond and leaves the remaining files for later. If LilyPond crashes partway through a file, the app engraves that file's PDFs again one at a time. If a file still fails, the reasons are listed in plain English, and LilyPond's full log is saved next to the file.
 
 You can also engrave outside the app with the `engrave_all` scripts in the run folder (see below).
 
@@ -6980,6 +8165,8 @@ At the top of the settings: type a name and press **Save** to store every settin
 
 **LilyPond ran out of memory**: lower **Pages per PDF** or **Max file size**, then engrave again.
 
+**LilyPond crashed** (on Windows, an exit code such as 3221225477, which is error 0xC0000005): LilyPond itself stopped unexpectedly, which is usually a one-off. The app recovers on its own: it engraves each PDF in that file separately, trying each one twice, and keeps any PDFs that were already made. Only if a PDF still won't engrave is the file listed as failed; then lower **Pages per PDF** or **Max file size** and press **Engrave PDFs** again.
+
 **"Stopped by an error … press Resume"**: the run stopped safely. Press **Resume** to carry on from the same place.
 
 **The preview tab didn't open**: your browser blocked it. Use the **Open the preview** link in the card that appears.
@@ -6989,6 +8176,16 @@ At the top of the settings: type a name and press **Save** to store every settin
 **Old score files still look the same after an update**: score files keep the layout they were written with. Press **Reset** and run again.
 
 **Where the app keeps its own files**: in the same place as the runs by default (next to the program, or Documents › Harmonarium): `chord_progress.json` (the saved run), `chord_presets.json`, `chord_config.json` (the LilyPond path) and `window-data` (the window's remembered settings).
+
+## License
+
+Harmonarium is Copyright © 2026 Joshua Nichols. It is free software: you can redistribute it and/or modify it under the terms of the [GNU General Public License](https://www.gnu.org/licenses/gpl-3.0.html), version 3 or (at your option) any later version. The Harmonarium logo is licensed under the same terms.
+
+Harmonarium comes with **no warranty**: it is distributed in the hope that it will be useful, but without even the implied warranty of merchantability or fitness for a particular purpose.
+
+The source code is at [github.com/joshdnichols/Harmonarium](https://github.com/joshdnichols/Harmonarium), and the built apps' downloads include it too.
+
+The GPL covers Harmonarium's own code and logo. It doesn't apply to your scores: they carry a [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) public domain dedication, so anyone may use them for anything. LilyPond, the music fonts, the panel's font (Academico), Python and the packages packed in with the app keep their own licenses, all listed on the **Acknowledgements** page.
 """
 
 # ---------------- the user guide (Markdown, shown in the app) ----------------
